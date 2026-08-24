@@ -7,6 +7,7 @@ import httpx
 
 from app.services.jobs import Job, JobStatus, get_semaphore, save_if_finished
 from app.services import library
+from app.services.slskd_select import _slskd_file_extension, select_best_candidate
 
 LIDARR_URL = os.environ.get("LIDARR_URL", "http://lidarr:8686")
 LIDARR_API_KEY = os.environ.get("LIDARR_API_KEY", "")
@@ -377,14 +378,6 @@ async def _slskd_api(method: str, path: str, json_data: dict = None) -> dict | l
         return resp.json()
 
 
-def _slskd_file_extension(filename: str) -> str:
-    """Return the real file extension from a slskd path, case-insensitive."""
-    basename = filename.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-    if "." not in basename:
-        return ""
-    return basename.rsplit(".", 1)[-1].lower()
-
-
 def _slskd_download_dir() -> str:
     return os.environ.get("SLSKD_DOWNLOAD_DIR") or f"{MUSIC_DIR}/.slskd-downloads"
 
@@ -398,30 +391,19 @@ def _find_completed_slskd_file(basename: str, download_dir: str | None = None) -
     return None
 
 
-def _pick_best_slskd_file(responses: list, requested_format: str) -> tuple[str, dict] | None:
+def _pick_best_slskd_file(
+    responses: list,
+    requested_format: str,
+    artist: str,
+    title: str,
+    album: str,
+) -> tuple[str, dict] | None:
     """Pick the best file from slskd search responses. Returns (username, file_info) or None."""
-    requested = requested_format.lower().lstrip(".")
-    if not requested:
+    result = select_best_candidate(responses, requested_format, artist, title, album)
+    if result is None:
         return None
-
-    candidates = []
-    for resp in responses:
-        username = resp.get("username", "")
-        for file in resp.get("files", []):
-            filename = file.get("filename", "")
-            ext = _slskd_file_extension(filename)
-            if ext != requested:
-                continue
-            size = file.get("size", 0)
-            if size < 500_000:  # skip tiny files (<500KB)
-                continue
-            score = 0
-            bit_rate = file.get("bitRate", 0)
-            score += min(bit_rate // 10, 50)
-            score += min(size // 1_000_000, 30)  # prefer larger files
-            candidates.append((score, username, file))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return (candidates[0][1], candidates[0][2]) if candidates else None
+    peer, file_info, _debug = result
+    return peer, file_info
 
 
 async def _download_track_slskd(artist: str, title: str, album: str, fmt: str, username: str = "") -> bool:
@@ -453,7 +435,7 @@ async def _download_track_slskd(artist: str, title: str, album: str, fmt: str, u
     if not responses:
         return False
 
-    result = _pick_best_slskd_file(responses, requested_format=fmt)
+    result = _pick_best_slskd_file(responses, fmt, artist, title, album)
     if not result:
         return False
 

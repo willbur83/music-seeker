@@ -32,7 +32,7 @@ def test_mp3_requested_selects_mp3_over_flac():
         _file("Artist - Song.mp3", bit_rate=192),
         _file("Artist - Song.flac", size=30_000_000, bit_rate=1411),
     )
-    result = _pick_best_slskd_file(responses, "mp3")
+    result = _pick_best_slskd_file(responses, "mp3", "Artist", "Song", "")
     assert result is not None
     _, chosen = result
     assert chosen["filename"].endswith(".mp3")
@@ -40,7 +40,7 @@ def test_mp3_requested_selects_mp3_over_flac():
 
 def test_mp3_requested_only_flac_returns_none():
     responses = _responses("peer1", _file("Artist - Song.flac", bit_rate=1411))
-    assert _pick_best_slskd_file(responses, "mp3") is None
+    assert _pick_best_slskd_file(responses, "mp3", "Artist", "Song", "") is None
 
 
 def test_flac_requested_selects_flac_over_mp3():
@@ -49,7 +49,7 @@ def test_flac_requested_selects_flac_over_mp3():
         _file("Artist - Song.mp3", bit_rate=320),
         _file("Artist - Song.flac", bit_rate=1411),
     )
-    result = _pick_best_slskd_file(responses, "flac")
+    result = _pick_best_slskd_file(responses, "flac", "Artist", "Song", "")
     assert result is not None
     _, chosen = result
     assert chosen["filename"].endswith(".flac")
@@ -57,7 +57,7 @@ def test_flac_requested_selects_flac_over_mp3():
 
 def test_uppercase_mp3_extension_counts_as_mp3():
     responses = _responses("peer1", _file("Artist - Song.MP3"))
-    result = _pick_best_slskd_file(responses, "mp3")
+    result = _pick_best_slskd_file(responses, "mp3", "Artist", "Song", "")
     assert result is not None
     _, chosen = result
     assert chosen["filename"].endswith(".MP3")
@@ -69,7 +69,7 @@ def test_high_quality_flac_does_not_beat_mp3_when_mp3_requested():
         _file("Artist - Song.mp3", size=5_000_000, bit_rate=128),
         _file("Artist - Song.flac", size=50_000_000, bit_rate=1411),
     )
-    result = _pick_best_slskd_file(responses, "mp3")
+    result = _pick_best_slskd_file(responses, "mp3", "Artist", "Song", "")
     assert result is not None
     _, chosen = result
     assert chosen["filename"].endswith(".mp3")

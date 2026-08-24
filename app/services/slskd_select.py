@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.services.downloader import _slskd_file_extension
+
+def _slskd_file_extension(filename: str) -> str:
+    """Return the real file extension from a slskd path, case-insensitive."""
+    basename = filename.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    if "." not in basename:
+        return ""
+    return basename.rsplit(".", 1)[-1].lower()
 
 # --- Identity tuning ---
 MIN_IDENTITY_CONFIDENCE = 70.0
