@@ -1,4 +1,5 @@
 import logging
+import os
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +19,8 @@ def create_app() -> FastAPI:
     # instrumentation without that blast radius.
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("app.services.recognize").setLevel(logging.INFO)
+    if os.environ.get("SLSKD_SELECT_DEBUG") == "1":
+        logging.getLogger("app.services.slskd_select").setLevel(logging.DEBUG)
 
     app = FastAPI(title="MusicSeeker", version=APP_VERSION)
 

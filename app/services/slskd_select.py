@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+_LOG_TOP_N = 10
 
 
 def _slskd_file_extension(filename: str) -> str:
@@ -263,6 +268,107 @@ def score_identity(
     )
 
 
+def _bitrate_reason(bit_rate: int) -> str | None:
+    if bit_rate >= 320:
+        return "320kbps"
+    if bit_rate >= 256:
+        return "256kbps"
+    if bit_rate >= 192:
+        return "192kbps"
+    if bit_rate > 0:
+        return f"{bit_rate}kbps"
+    return None
+
+
+def _identity_reasons(identity: IdentityResult, quality: QualityResult | None = None) -> list[str]:
+    reasons: list[str] = []
+    if identity.title_matched:
+        reasons.append("title_match")
+    if identity.artist_matched:
+        reasons.append("artist_path_match")
+    if identity.album_matched:
+        reasons.append("album_path_match")
+    if quality is not None:
+        bitrate_label = _bitrate_reason(quality.bit_rate)
+        if bitrate_label:
+            reasons.append(bitrate_label)
+    return reasons
+
+
+def _is_interesting_reject(entry: dict) -> bool:
+    reason = entry.get("reject_reason")
+    if not reason:
+        return False
+    if reason in ("format_mismatch", "too_small"):
+        return False
+    if reason == "low_identity_confidence":
+        return True
+    return reason.startswith("unexpected_") and reason.endswith("_qualifier")
+
+
+def _log_selection_debug(
+    strategy: str | None,
+    query: str | None,
+    peer_response_count: int,
+    eligible_format: int,
+    above_threshold: int,
+    candidates: list[dict],
+    rejected: list[dict],
+    selected: dict | None,
+) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    summary_parts = [
+        f"responses={peer_response_count}",
+        f"eligible_format={eligible_format}",
+        f"above_confidence_threshold={above_threshold}",
+    ]
+    if strategy:
+        summary_parts.insert(0, f"strategy={strategy}")
+    if query:
+        summary_parts.insert(1 if strategy else 0, f"query={query!r}")
+    logger.debug("slskd_select attempt %s", " ".join(summary_parts))
+
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda entry: entry.get("quality_score", 0),
+        reverse=True,
+    )
+    for entry in sorted_candidates[:_LOG_TOP_N]:
+        identity = entry.get("identity", {})
+        logger.debug(
+            "slskd_select candidate peer=%s path=%r identity_score=%s quality_score=%s reasons=%s",
+            entry.get("peer"),
+            entry.get("filename"),
+            identity.get("confidence"),
+            entry.get("quality_score"),
+            entry.get("reasons"),
+        )
+
+    interesting_rejects = [entry for entry in rejected if _is_interesting_reject(entry)]
+    for entry in interesting_rejects[:_LOG_TOP_N]:
+        logger.debug(
+            "slskd_select rejected peer=%s path=%r reject_reason=%s",
+            entry.get("peer"),
+            entry.get("filename"),
+            entry.get("reject_reason"),
+        )
+
+    if selected:
+        logger.debug(
+            "slskd_select selected_candidate peer=%s path=%r strategy=%s reason=best_quality_score",
+            selected.get("peer"),
+            selected.get("filename"),
+            strategy,
+        )
+    else:
+        logger.debug(
+            "slskd_select no_candidate_selected strategy=%s fallback_continues",
+            strategy,
+        )
+
+
 def score_quality(file_dict: dict, peer_dict: dict) -> QualityResult:
     """Rank acceptable identity matches by transfer/audio quality signals."""
     bit_rate = int(file_dict.get("bitRate", 0) or 0)
@@ -299,14 +405,20 @@ def select_best_candidate(
     artist: str,
     title: str,
     album: str,
-) -> tuple[str, dict, dict] | None:
+    strategy: str | None = None,
+    query: str | None = None,
+) -> tuple[str | None, dict | None, dict]:
     """Pick the best Soulseek file after strict format, size, and identity filters."""
+    debug: dict = {"candidates": [], "rejected": []}
     requested = requested_format.lower().lstrip(".")
     if not requested:
-        return None
+        _log_selection_debug(
+            strategy, query, len(responses), 0, 0, debug["candidates"], debug["rejected"], None
+        )
+        return None, None, debug
 
     survivors: list[tuple[QualityResult, IdentityResult, str, dict]] = []
-    debug: dict = {"candidates": [], "rejected": []}
+    eligible_format = 0
 
     for resp in responses:
         peer = resp.get("username", "")
@@ -330,6 +442,7 @@ def select_best_candidate(
                 debug["rejected"].append(entry)
                 continue
 
+            eligible_format += 1
             identity = score_identity(artist, title, album, filename)
             entry["identity"] = {
                 "confidence": identity.confidence,
@@ -345,18 +458,44 @@ def select_best_candidate(
 
             quality = score_quality(file_info, resp)
             entry["quality_score"] = quality.score
+            entry["reasons"] = _identity_reasons(identity, quality)
             debug["candidates"].append(entry)
             survivors.append((quality, identity, peer, file_info))
 
-    if not survivors:
-        return None
+    above_threshold = len(survivors)
+    selected: dict | None = None
 
-    survivors.sort(key=lambda item: item[0].score, reverse=True)
-    quality, identity, peer, file_info = survivors[0]
-    debug["selected"] = {
-        "peer": peer,
-        "filename": file_info.get("filename", ""),
-        "identity_confidence": identity.confidence,
-        "quality_score": quality.score,
-    }
-    return peer, file_info, debug
+    if survivors:
+        survivors.sort(key=lambda item: item[0].score, reverse=True)
+        quality, identity, peer, file_info = survivors[0]
+        selected = {
+            "peer": peer,
+            "filename": file_info.get("filename", ""),
+            "identity_confidence": identity.confidence,
+            "quality_score": quality.score,
+            "reasons": _identity_reasons(identity, quality),
+        }
+        debug["selected"] = selected
+        _log_selection_debug(
+            strategy,
+            query,
+            len(responses),
+            eligible_format,
+            above_threshold,
+            debug["candidates"],
+            debug["rejected"],
+            selected,
+        )
+        return peer, file_info, debug
+
+    _log_selection_debug(
+        strategy,
+        query,
+        len(responses),
+        eligible_format,
+        above_threshold,
+        debug["candidates"],
+        debug["rejected"],
+        None,
+    )
+    return None, None, debug

@@ -328,12 +328,21 @@ def _pick_best_slskd_file(
     artist: str,
     title: str,
     album: str,
+    strategy: str | None = None,
+    query: str | None = None,
 ) -> tuple[str, dict] | None:
     """Pick the best file from slskd search responses. Returns (username, file_info) or None."""
-    result = select_best_candidate(responses, requested_format, artist, title, album)
-    if result is None:
+    peer, file_info, _debug = select_best_candidate(
+        responses,
+        requested_format,
+        artist,
+        title,
+        album,
+        strategy=strategy,
+        query=query,
+    )
+    if peer is None:
         return None
-    peer, file_info, _debug = result
     return peer, file_info
 
 
@@ -401,7 +410,15 @@ async def _download_track_slskd(
         if not responses:
             continue
 
-        result = _pick_best_slskd_file(responses, fmt, artist, title, album)
+        result = _pick_best_slskd_file(
+            responses,
+            fmt,
+            artist,
+            title,
+            album,
+            strategy=attempt["strategy"],
+            query=query,
+        )
         if not result:
             continue
 

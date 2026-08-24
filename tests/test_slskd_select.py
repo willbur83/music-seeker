@@ -61,8 +61,8 @@ def test_blink182_selects_studio_path_despite_album_mismatch():
         "All The Small Things",
         "Greatest Hits",
     )
-    assert result is not None
     peer, chosen, _debug = result
+    assert peer is not None
     assert peer == "peer1"
     assert "All The Small Things" in chosen["filename"]
 
@@ -123,8 +123,8 @@ def test_rhcp_cant_stop_prefers_correct_artist_path():
         "Can't Stop",
         "By the Way",
     )
-    assert result is not None
     peer, chosen, _debug = result
+    assert peer is not None
     assert peer == "good_peer"
     assert "Red Hot Chili Peppers" in chosen["filename"]
 
@@ -176,8 +176,8 @@ def test_matchbox_twenty_3am_studio_beats_ultimix_remix():
         "3AM",
         "Yourself or Someone Like You",
     )
-    assert result is not None
     peer, chosen, _debug = result
+    assert peer is not None
     assert peer == "studio_peer"
     assert "Ultimix" not in chosen["filename"]
 
@@ -189,16 +189,20 @@ def test_matchbox_twenty_remix_only_returns_none():
         uploadSpeed=80000,
         hasFreeUploadSlot=True,
     )
-    assert (
-        select_best_candidate(
-            responses,
-            "mp3",
-            "Matchbox Twenty",
-            "3AM",
-            "Yourself or Someone Like You",
-        )
-        is None
+    peer, _chosen, debug = select_best_candidate(
+        responses,
+        "mp3",
+        "Matchbox Twenty",
+        "3AM",
+        "Yourself or Someone Like You",
     )
+    assert peer is None
+    remix_rejects = [
+        entry
+        for entry in debug["rejected"]
+        if entry.get("reject_reason") == "unexpected_remix_qualifier"
+    ]
+    assert remix_rejects
 
 
 # --- Live / version qualifiers ---
@@ -296,8 +300,8 @@ def test_correct_studio_192k_beats_wrong_artist_320k_remix():
         "Song",
         "Album",
     )
-    assert result is not None
     peer, chosen, _debug = result
+    assert peer is not None
     assert peer == "studio_peer"
     assert chosen["bitRate"] == 192
 
@@ -335,6 +339,49 @@ def test_correct_artist_title_beats_compilation_with_better_peer_metrics():
         "Can't Stop",
         "By the Way",
     )
-    assert result is not None
     peer, _chosen, _debug = result
+    assert peer is not None
     assert peer == "studio_peer"
+
+
+# --- DEBUG observability ---
+
+
+def test_successful_pick_debug_includes_identity_quality_and_reasons():
+    responses = _responses(
+        "good_peer",
+        _file(r"\Red Hot Chili Peppers\By the Way\04 Can't Stop.mp3", bit_rate=320),
+    )
+    peer, _chosen, debug = select_best_candidate(
+        responses,
+        "mp3",
+        "Red Hot Chili Peppers",
+        "Can't Stop",
+        "By the Way",
+        strategy="artist_title",
+        query="Red Hot Chili Peppers Can't Stop",
+    )
+    assert peer == "good_peer"
+    assert debug["selected"]["identity_confidence"] >= MIN_IDENTITY_CONFIDENCE
+    assert debug["selected"]["quality_score"] > 0
+    assert "title_match" in debug["selected"]["reasons"]
+    assert "artist_path_match" in debug["selected"]["reasons"]
+    assert "320kbps" in debug["selected"]["reasons"]
+    candidate = debug["candidates"][0]
+    assert "title_match" in candidate["reasons"]
+    assert "artist_path_match" in candidate["reasons"]
+
+
+def test_slskd_select_debug_env_sets_logger_level():
+    import os
+
+    from app import create_app
+
+    os.environ["SLSKD_SELECT_DEBUG"] = "1"
+    try:
+        create_app()
+        import logging
+
+        assert logging.getLogger("app.services.slskd_select").level == logging.DEBUG
+    finally:
+        del os.environ["SLSKD_SELECT_DEBUG"]
