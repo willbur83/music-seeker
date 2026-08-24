@@ -108,6 +108,7 @@ async def deezer_get_track(track_id: str) -> dict:
         "artist": item.get("artist", {}).get("name", ""),
         "album": item.get("album", {}).get("title", ""),
         "image": item.get("album", {}).get("cover_big", ""),
+        "track_number": item.get("track_position"),
     }
 
 

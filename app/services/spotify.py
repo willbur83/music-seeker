@@ -466,12 +466,21 @@ def parse_spotify_url(url: str) -> tuple[str, str] | None:
 async def get_track_metadata(track_id: str) -> dict:
     """Get basic metadata for a single track."""
     data = await spotify_get(f"tracks/{track_id}")
-    return {
+    album = data.get("album", {})
+    result = {
         "name": data["name"],
         "artist": ", ".join(a["name"] for a in data.get("artists", [])),
-        "album": data.get("album", {}).get("name", ""),
-        "image": _best_image(data.get("album", {}).get("images", [])),
+        "album": album.get("name", ""),
+        "image": _best_image(album.get("images", [])),
+        "track_number": data.get("track_number"),
     }
+    album_artists = album.get("artists", [])
+    if album_artists:
+        result["album_artist"] = ", ".join(a["name"] for a in album_artists)
+    release_date = album.get("release_date", "")
+    if release_date:
+        result["year"] = release_date[:4]
+    return result
 
 
 async def get_album_tracks(album_id: str) -> list[dict]:

@@ -159,21 +159,6 @@ async def _resolve_tracks(job: Job) -> list[dict]:
     return [{"name": job.title, "artist": "", "album": ""}]
 
 
-async def _download_cover(image_url: str, dest_path: str) -> bool:
-    """Download album art from Spotify to a temp file."""
-    if not image_url:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(image_url)
-            resp.raise_for_status()
-            with open(dest_path, "wb") as f:
-                f.write(resp.content)
-            return True
-    except Exception:
-        return False
-
-
 async def _download_track_ytdlp(artist: str, title: str, album: str, fmt: str,
                                  image_url: str = "", is_podcast: bool = False,
                                  username: str = "") -> bool:
@@ -216,69 +201,15 @@ async def _download_track_ytdlp(artist: str, title: str, album: str, fmt: str,
     if not os.path.exists(final_file):
         return False
 
-    # Step 2: Embed Spotify metadata + album art via ffmpeg/metaflac
-    if fmt == "flac":
-        # For FLAC: use metaflac for tags and cover
-        tag_cmd = [
-            "metaflac",
-            "--remove-all-tags",
-            f"--set-tag=ARTIST={artist}",
-            f"--set-tag=TITLE={title}",
-            f"--set-tag=ALBUM={album}",
-            final_file,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *tag_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        await proc.wait()
-
-        # Embed cover art
-        if image_url:
-            cover_path = f"{final_file}.cover.jpg"
-            if await _download_cover(image_url, cover_path):
-                try:
-                    embed = await asyncio.create_subprocess_exec(
-                        "metaflac", "--import-picture-from", cover_path, final_file,
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                    )
-                    await embed.wait()
-                finally:
-                    if os.path.exists(cover_path):
-                        os.remove(cover_path)
-    else:
-        # For MP3/other: use ffmpeg to embed metadata + cover in one pass
-        cover_path = f"{final_file}.cover.jpg"
-        has_cover = image_url and await _download_cover(image_url, cover_path)
-        tmp_out = f"{final_file}.tmp.{fmt}"
-        try:
-            ffmpeg_cmd = [
-                "ffmpeg", "-y", "-i", final_file,
-            ]
-            if has_cover:
-                ffmpeg_cmd.extend(["-i", cover_path, "-map", "0:a", "-map", "1:0",
-                                   "-c:v", "mjpeg", "-id3v2_version", "3",
-                                   "-metadata:s:v", "title=Album cover",
-                                   "-metadata:s:v", "comment=Cover (front)"])
-            else:
-                ffmpeg_cmd.extend(["-map", "0:a"])
-            ffmpeg_cmd.extend([
-                "-c:a", "copy",
-                "-metadata", f"artist={artist}",
-                "-metadata", f"title={title}",
-                "-metadata", f"album={album}",
-                tmp_out,
-            ])
-            proc = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            )
-            await proc.wait()
-            if proc.returncode == 0 and os.path.exists(tmp_out):
-                os.replace(tmp_out, final_file)
-            elif os.path.exists(tmp_out):
-                os.remove(tmp_out)
-        finally:
-            if os.path.exists(cover_path):
-                os.remove(cover_path)
+    # Step 2: Embed catalog metadata + album art
+    from app.services.audio_tags import embed_catalog_metadata
+    await embed_catalog_metadata(
+        final_file,
+        artist=artist,
+        title=title,
+        album=album,
+        image_url=image_url,
+    )
 
     # Analyze BPM and write to file tags
     try:
@@ -432,7 +363,17 @@ async def _slskd_delete_search(search_id: str) -> None:
         pass
 
 
-async def _download_track_slskd(artist: str, title: str, album: str, fmt: str, username: str = "") -> bool:
+async def _download_track_slskd(
+    artist: str,
+    title: str,
+    album: str,
+    fmt: str,
+    username: str = "",
+    image_url: str = "",
+    track_number: int | None = None,
+    album_artist: str | None = None,
+    year: str | None = None,
+) -> bool:
     """Search and download a single track via slskd. Returns True if successful."""
     for attempt in search_attempts(artist, title, album):
         query = attempt["query"]
@@ -496,7 +437,17 @@ async def _download_track_slskd(artist: str, title: str, album: str, fmt: str, u
                         if found:
                             dest = os.path.join(dest_dir, f"{_sanitize(title)}.{basename.rsplit('.', 1)[-1]}")
                             shutil.move(found, dest)
-                            # Analyze BPM and write to file tags
+                            from app.services.audio_tags import embed_catalog_metadata
+                            await embed_catalog_metadata(
+                                dest,
+                                artist=artist,
+                                title=title,
+                                album=album,
+                                track_number=track_number,
+                                album_artist=album_artist,
+                                year=year,
+                                image_url=image_url,
+                            )
                             try:
                                 from app.services import bpm as bpm_service
                                 await bpm_service.analyze_and_tag(dest, title, artist)
@@ -551,7 +502,17 @@ async def _run_slskd(job: Job):
         job.progress_text = f"{i}/{total} — Searching Soulseek for {artist} - {name}"
         job.progress = int((i - 1) / total * 100)
 
-        ok = await _download_track_slskd(artist, name, album, job.format, username=job.username)
+        ok = await _download_track_slskd(
+            artist,
+            name,
+            album,
+            job.format,
+            username=job.username,
+            image_url=track.get("image", ""),
+            track_number=track.get("track_number"),
+            album_artist=track.get("album_artist"),
+            year=track.get("year"),
+        )
         if not ok:
             failed.append(f"{artist} - {name}")
 
