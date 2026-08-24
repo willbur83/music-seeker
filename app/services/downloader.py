@@ -7,7 +7,7 @@ import httpx
 
 from app.services.jobs import Job, JobStatus, get_semaphore, save_if_finished
 from app.services import library
-from app.services.slskd_select import _slskd_file_extension, select_best_candidate
+from app.services.slskd_select import _slskd_file_extension, search_attempts, select_best_candidate
 
 LIDARR_URL = os.environ.get("LIDARR_URL", "http://lidarr:8686")
 LIDARR_API_KEY = os.environ.get("LIDARR_API_KEY", "")
@@ -406,81 +406,108 @@ def _pick_best_slskd_file(
     return peer, file_info
 
 
-async def _download_track_slskd(artist: str, title: str, album: str, fmt: str, username: str = "") -> bool:
-    """Search and download a single track via slskd. Returns True if successful."""
-    # Use only primary artist for search (avoid "Artist1, Artist2" cluttering results)
-    search_artist = artist.split(",")[0].strip() if artist else ""
-    query = f"{search_artist} {title}" if search_artist else title
-
-    # Start search
-    search_result = await _slskd_api("POST", "searches", {"searchText": query})
-    search_id = search_result.get("id")
-    if not search_id:
-        return False
-
-    # Wait for search to complete
+async def _slskd_wait_for_search(search_id: str) -> bool:
+    """Poll slskd until the search completes. Returns False on timeout or error."""
     for _ in range(30):  # 60s timeout
         await asyncio.sleep(2)
-        status = await _slskd_api("GET", f"searches/{search_id}")
+        try:
+            status = await _slskd_api("GET", f"searches/{search_id}")
+        except Exception:
+            return False
+        if not status:
+            return False
         state = status.get("state", "")
         if "Completed" in state:
-            break
+            return True
         if any(s in state for s in ("Errored", "Cancelled")):
             return False
-    else:
-        return False
+    return False
 
-    # Get responses and pick best file
-    responses = await _slskd_api("GET", f"searches/{search_id}/responses")
-    if not responses:
-        return False
 
-    result = _pick_best_slskd_file(responses, fmt, artist, title, album)
-    if not result:
-        return False
+async def _slskd_delete_search(search_id: str) -> None:
+    """Best-effort cleanup of a completed slskd search."""
+    try:
+        await _slskd_api("DELETE", f"searches/{search_id}")
+    except Exception:
+        pass
 
-    peer, file_info = result
 
-    # Queue download
-    await _slskd_api("POST", f"transfers/downloads/{peer}", [file_info])
+async def _download_track_slskd(artist: str, title: str, album: str, fmt: str, username: str = "") -> bool:
+    """Search and download a single track via slskd. Returns True if successful."""
+    for attempt in search_attempts(artist, title, album):
+        query = attempt["query"]
 
-    # Poll until download completes
-    filename = file_info.get("filename", "")
-    for _ in range(300):  # 10min timeout (P2P can be slow)
-        await asyncio.sleep(2)
-        data = await _slskd_api("GET", f"transfers/downloads/{peer}")
-        if not data:
+        try:
+            search_result = await _slskd_api("POST", "searches", {"searchText": query})
+        except Exception:
             continue
-        # Navigate directories[].files[] structure
-        directories = data.get("directories", []) if isinstance(data, dict) else []
-        for dir_entry in directories:
-            for dl in dir_entry.get("files", []):
-                if dl.get("filename") != filename:
-                    continue
-                state = dl.get("state", "")
-                if "Succeeded" in state or "Completed" in state:
-                    # Move file from slskd download dir to music library
-                    safe_artist = _sanitize(artist) or "Unknown Artist"
-                    safe_album = _sanitize(album) or "Unknown Album"
-                    base = f"{MUSIC_DIR}/{_sanitize(username)}" if username else MUSIC_DIR
-                    dest_dir = f"{base}/{safe_artist}/{safe_album}"
-                    os.makedirs(dest_dir, exist_ok=True)
-                    # slskd saves to {downloads_dir}/{remote_dir}/{filename}
-                    basename = filename.rsplit("\\", 1)[-1] if "\\" in filename else os.path.basename(filename)
-                    found = _find_completed_slskd_file(basename)
-                    if found:
-                        dest = os.path.join(dest_dir, f"{_sanitize(title)}.{basename.rsplit('.', 1)[-1]}")
-                        shutil.move(found, dest)
-                        # Analyze BPM and write to file tags
-                        try:
-                            from app.services import bpm as bpm_service
-                            await bpm_service.analyze_and_tag(dest, title, artist)
-                        except Exception:
-                            pass
-                        return True
-                    return False  # download succeeded but file not found locally
-                if any(s in state for s in ("Failed", "Cancelled", "Errored")):
-                    return False
+
+        search_id = search_result.get("id") if search_result else None
+        if not search_id:
+            continue
+
+        if not await _slskd_wait_for_search(search_id):
+            await _slskd_delete_search(search_id)
+            continue
+
+        try:
+            responses = await _slskd_api("GET", f"searches/{search_id}/responses")
+        except Exception:
+            responses = None
+
+        await _slskd_delete_search(search_id)
+
+        if not responses:
+            continue
+
+        result = _pick_best_slskd_file(responses, fmt, artist, title, album)
+        if not result:
+            continue
+
+        peer, file_info = result
+
+        # Queue download
+        await _slskd_api("POST", f"transfers/downloads/{peer}", [file_info])
+
+        # Poll until download completes
+        filename = file_info.get("filename", "")
+        for _ in range(300):  # 10min timeout (P2P can be slow)
+            await asyncio.sleep(2)
+            data = await _slskd_api("GET", f"transfers/downloads/{peer}")
+            if not data:
+                continue
+            # Navigate directories[].files[] structure
+            directories = data.get("directories", []) if isinstance(data, dict) else []
+            for dir_entry in directories:
+                for dl in dir_entry.get("files", []):
+                    if dl.get("filename") != filename:
+                        continue
+                    state = dl.get("state", "")
+                    if "Succeeded" in state or "Completed" in state:
+                        # Move file from slskd download dir to music library
+                        safe_artist = _sanitize(artist) or "Unknown Artist"
+                        safe_album = _sanitize(album) or "Unknown Album"
+                        base = f"{MUSIC_DIR}/{_sanitize(username)}" if username else MUSIC_DIR
+                        dest_dir = f"{base}/{safe_artist}/{safe_album}"
+                        os.makedirs(dest_dir, exist_ok=True)
+                        # slskd saves to {downloads_dir}/{remote_dir}/{filename}
+                        basename = filename.rsplit("\\", 1)[-1] if "\\" in filename else os.path.basename(filename)
+                        found = _find_completed_slskd_file(basename)
+                        if found:
+                            dest = os.path.join(dest_dir, f"{_sanitize(title)}.{basename.rsplit('.', 1)[-1]}")
+                            shutil.move(found, dest)
+                            # Analyze BPM and write to file tags
+                            try:
+                                from app.services import bpm as bpm_service
+                                await bpm_service.analyze_and_tag(dest, title, artist)
+                            except Exception:
+                                pass
+                            return True
+                        return False  # download succeeded but file not found locally
+                    if any(s in state for s in ("Failed", "Cancelled", "Errored")):
+                        return False
+        continue
+
     return False
 
 

@@ -78,6 +78,28 @@ def normalize_query_text(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+def search_attempts(artist: str, title: str, album: str) -> list[dict]:
+    """Return ordered Soulseek search queries, deduplicated by normalized text."""
+    attempts: list[dict] = []
+    seen_normalized: set[str] = set()
+
+    def _add(strategy: str, query: str) -> None:
+        normalized = normalize_query_text(query)
+        if not normalized or normalized in seen_normalized:
+            return
+        seen_normalized.add(normalized)
+        attempts.append({"strategy": strategy, "query": query})
+
+    search_artist = artist.split(",")[0].strip() if artist else ""
+    artist_title_query = f"{search_artist} {title}" if search_artist else title
+    _add("artist_title", artist_title_query)
+    _add("title_only", title)
+    if album.strip():
+        _add("title_album", f"{title} {album}")
+
+    return attempts
+
+
 def normalize_path_text(path: str) -> str:
     """Normalize a remote path/filename for token and qualifier matching."""
     path = path.replace("\\", "/")
