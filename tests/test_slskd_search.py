@@ -93,15 +93,17 @@ def _patch_download_env(monkeypatch, tmp_path):
     monkeypatch.setattr(downloader, "SLSKD_API_KEY", "test-key")
 
 
-def _make_slskd_api_mock(responses_by_query: dict):
+def _make_slskd_api_mock(responses_by_query: dict, fail_enqueue_peers: set[str] | None = None):
     """Build an AsyncMock for _slskd_api keyed by search query text."""
     search_ids: dict[str, str] = {}
     id_to_query: dict[str, str] = {}
     counter = {"n": 0}
     post_searches_calls: list[str] = []
     transfer_posts: list[tuple] = []
+    enqueue_attempts: list[str] = []
+    fail_enqueue_peers = fail_enqueue_peers or set()
 
-    async def mock_api(method: str, path: str, json_data: dict | None = None):
+    async def mock_api(method: str, path: str, json_data: dict | list | None = None):
         if method == "POST" and path == "searches":
             query = (json_data or {}).get("searchText", "")
             post_searches_calls.append(query)
@@ -124,6 +126,12 @@ def _make_slskd_api_mock(responses_by_query: dict):
 
         if method == "POST" and path.startswith("transfers/downloads/"):
             peer = path.split("/")[-1]
+            enqueue_attempts.append(peer)
+            if peer in fail_enqueue_peers:
+                raise RuntimeError(
+                    f"Server error '500 Internal Server Error' for url "
+                    f"'http://slskd/api/v0/transfers/downloads/{peer}'"
+                )
             transfer_posts.append((peer, json_data))
             return None
 
@@ -146,6 +154,7 @@ def _make_slskd_api_mock(responses_by_query: dict):
 
     mock_api.post_searches_calls = post_searches_calls
     mock_api.transfer_posts = transfer_posts
+    mock_api.enqueue_attempts = enqueue_attempts
     return mock_api
 
 
@@ -272,3 +281,47 @@ def test_duplicate_normalized_queries_search_executed_once(monkeypatch, tmp_path
     assert ok is True
     assert mock.post_searches_calls == ["Can't Stop", "Can't Stop By the Way"]
     assert mock.transfer_posts[0][0] == "album_peer"
+
+
+def test_enqueue_500_tries_next_peer(monkeypatch, tmp_path):
+    _patch_download_env(monkeypatch, tmp_path)
+    responses = {
+        "Artist Song": _responses(
+            "bobs-server",
+            _file(r"\Artist\Album\Song.mp3", bit_rate=320),
+        ) + _responses(
+            "good_peer",
+            _file(r"\Artist\Album\Song.mp3", bit_rate=192),
+        ),
+    }
+    mock = _make_slskd_api_mock(responses, fail_enqueue_peers={"bobs-server"})
+
+    with patch.object(downloader, "_slskd_api", mock), patch.object(
+        asyncio, "sleep", new=AsyncMock()
+    ), patch.object(
+        downloader, "_find_completed_slskd_file", return_value=str(tmp_path / "Song.mp3")
+    ), patch("shutil.move"):
+        ok = _run_download("Artist", "Song", "Album", "mp3")
+
+    assert ok is True
+    assert mock.enqueue_attempts == ["bobs-server", "good_peer"]
+    assert mock.transfer_posts[0][0] == "good_peer"
+    assert mock.post_searches_calls == ["Artist Song"]
+
+
+def test_enqueue_500_all_peers_returns_false_without_raising(monkeypatch, tmp_path):
+    _patch_download_env(monkeypatch, tmp_path)
+    responses = {
+        "Artist Song": _responses("dead_peer", _file(r"\Artist\Album\Song.mp3")),
+        "Song": _responses("also_dead", _file(r"\Artist\Album\Song.mp3")),
+    }
+    mock = _make_slskd_api_mock(responses, fail_enqueue_peers={"dead_peer", "also_dead"})
+
+    with patch.object(downloader, "_slskd_api", mock), patch.object(
+        asyncio, "sleep", new=AsyncMock()
+    ):
+        ok = _run_download("Artist", "Song", "Album", "mp3")
+
+    assert ok is False
+    assert mock.enqueue_attempts == ["dead_peer", "also_dead"]
+    assert mock.transfer_posts == []

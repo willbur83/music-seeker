@@ -1,13 +1,20 @@
 import asyncio
+import logging
 import os
 import re
 import shutil
 import time
+from urllib.parse import quote
+
 import httpx
 
 from app.services.jobs import Job, JobStatus, get_semaphore, save_if_finished
 from app.services import library
 from app.services.slskd_select import _slskd_file_extension, search_attempts, select_best_candidate
+
+logger = logging.getLogger(__name__)
+_SLSKD_RETRY_STATUSES = {429, 502, 503}
+_SLSKD_MAX_PEER_TRIES = 8
 
 LIDARR_URL = os.environ.get("LIDARR_URL", "http://lidarr:8686")
 LIDARR_API_KEY = os.environ.get("LIDARR_API_KEY", "")
@@ -292,21 +299,67 @@ async def _run_ytdlp(job: Job):
     return len(failed) < total
 
 
-async def _slskd_api(method: str, path: str, json_data: dict = None) -> dict | list | None:
+async def _slskd_api(method: str, path: str, json_data: dict | list | None = None) -> dict | list | None:
     """Call slskd REST API."""
     headers = {"X-API-Key": SLSKD_API_KEY}
+    url_path = f"/api/v0/{path}"
     async with httpx.AsyncClient(base_url=SLSKD_URL, headers=headers, timeout=30) as client:
-        if method == "GET":
-            resp = await client.get(f"/api/v0/{path}")
-        elif method == "POST":
-            resp = await client.post(f"/api/v0/{path}", json=json_data or {})
-        elif method == "DELETE":
-            resp = await client.delete(f"/api/v0/{path}")
-            return None
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(4):
+            if method == "GET":
+                resp = await client.get(url_path)
+            elif method == "POST":
+                payload = {} if json_data is None else json_data
+                resp = await client.post(url_path, json=payload)
+            elif method == "DELETE":
+                resp = await client.delete(url_path)
+                return None
+            else:
+                raise ValueError(f"Unknown method: {method}")
+            if resp.status_code in _SLSKD_RETRY_STATUSES and attempt < 3:
+                logger.warning(
+                    "slskd %s %s returned %s; retrying (%s/3)",
+                    method, url_path, resp.status_code, attempt + 1,
+                )
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError:
+                body = (resp.text or "").strip().replace("\n", " ")[:300]
+                logger.warning("slskd %s %s failed: %s %s", method, url_path, resp.status_code, body)
+                raise
+            if resp.status_code == 204 or not resp.content:
+                return None
+            return resp.json()
+    return None
+
+
+def _slskd_transfer_path(peer: str) -> str:
+    return f"transfers/downloads/{quote(peer, safe='')}"
+
+
+def _slskd_transfer_payload(file_info: dict) -> list[dict]:
+    """slskd enqueue only needs filename + size; extra search fields can 500."""
+    return [{
+        "filename": file_info.get("filename", ""),
+        "size": int(file_info.get("size", 0) or 0),
+    }]
+
+
+def _slskd_enqueue_lock() -> asyncio.Lock:
+    """Per-event-loop lock so concurrent jobs serialize enqueue without breaking pytest."""
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, "_musicseeker_slskd_enqueue_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, "_musicseeker_slskd_enqueue_lock", lock)
+    return lock
+
+
+async def _slskd_enqueue_download(peer: str, file_info: dict) -> None:
+    """POST a single-file download. slskd rejects concurrent enqueue with 429."""
+    async with _slskd_enqueue_lock():
+        await _slskd_api("POST", _slskd_transfer_path(peer), _slskd_transfer_payload(file_info))
 
 
 def _slskd_download_dir() -> str:
@@ -372,6 +425,72 @@ async def _slskd_delete_search(search_id: str) -> None:
         pass
 
 
+async def _move_slskd_file_to_library(
+    filename: str,
+    artist: str,
+    title: str,
+    album: str,
+    username: str,
+    image_url: str,
+    track_number: int | None,
+    album_artist: str | None,
+    year: str | None,
+) -> bool:
+    """Move a completed slskd file into the catalog library path and tag it."""
+    safe_artist = _sanitize(artist) or "Unknown Artist"
+    safe_album = _sanitize(album) or "Unknown Album"
+    base = f"{MUSIC_DIR}/{_sanitize(username)}" if username else MUSIC_DIR
+    dest_dir = f"{base}/{safe_artist}/{safe_album}"
+    os.makedirs(dest_dir, exist_ok=True)
+    basename = filename.rsplit("\\", 1)[-1] if "\\" in filename else os.path.basename(filename)
+    found = _find_completed_slskd_file(basename)
+    if not found:
+        return False
+    dest = os.path.join(dest_dir, f"{_sanitize(title)}.{basename.rsplit('.', 1)[-1]}")
+    shutil.move(found, dest)
+    from app.services.audio_tags import embed_catalog_metadata
+    await embed_catalog_metadata(
+        dest,
+        artist=artist,
+        title=title,
+        album=album,
+        track_number=track_number,
+        album_artist=album_artist,
+        year=year,
+        image_url=image_url,
+    )
+    try:
+        from app.services import bpm as bpm_service
+        await bpm_service.analyze_and_tag(dest, title, artist)
+    except Exception:
+        pass
+    return True
+
+
+async def _poll_slskd_transfer(peer: str, filename: str) -> str | None:
+    """Return Succeeded, Failed, or None on timeout."""
+    for _ in range(300):  # 10min timeout (P2P can be slow)
+        await asyncio.sleep(2)
+        try:
+            data = await _slskd_api("GET", _slskd_transfer_path(peer))
+        except Exception:
+            logger.warning("slskd transfer poll failed peer=%s", peer, exc_info=True)
+            return "Failed"
+        if not data:
+            continue
+        directories = data.get("directories", []) if isinstance(data, dict) else []
+        for dir_entry in directories:
+            for dl in dir_entry.get("files", []):
+                if dl.get("filename") != filename:
+                    continue
+                state = dl.get("state", "")
+                if any(s in state for s in ("Failed", "Cancelled", "Errored")):
+                    return "Failed"
+                if "Succeeded" in state or "Completed" in state:
+                    return "Succeeded"
+    return None
+
+
 async def _download_track_slskd(
     artist: str,
     title: str,
@@ -390,6 +509,7 @@ async def _download_track_slskd(
         try:
             search_result = await _slskd_api("POST", "searches", {"searchText": query})
         except Exception:
+            logger.warning("slskd search POST failed for query=%r", query, exc_info=True)
             continue
 
         search_id = search_result.get("id") if search_result else None
@@ -403,6 +523,7 @@ async def _download_track_slskd(
         try:
             responses = await _slskd_api("GET", f"searches/{search_id}/responses")
         except Exception:
+            logger.warning("slskd search responses failed id=%s query=%r", search_id, query, exc_info=True)
             responses = None
 
         await _slskd_delete_search(search_id)
@@ -410,71 +531,56 @@ async def _download_track_slskd(
         if not responses:
             continue
 
-        result = _pick_best_slskd_file(
-            responses,
-            fmt,
-            artist,
-            title,
-            album,
-            strategy=attempt["strategy"],
-            query=query,
-        )
-        if not result:
-            continue
+        excluded_peers: set[str] = set()
+        for _ in range(_SLSKD_MAX_PEER_TRIES):
+            filtered = [resp for resp in responses if resp.get("username") not in excluded_peers]
+            result = _pick_best_slskd_file(
+                filtered,
+                fmt,
+                artist,
+                title,
+                album,
+                strategy=attempt["strategy"],
+                query=query,
+            )
+            if not result:
+                break
 
-        peer, file_info = result
-
-        # Queue download
-        await _slskd_api("POST", f"transfers/downloads/{peer}", [file_info])
-
-        # Poll until download completes
-        filename = file_info.get("filename", "")
-        for _ in range(300):  # 10min timeout (P2P can be slow)
-            await asyncio.sleep(2)
-            data = await _slskd_api("GET", f"transfers/downloads/{peer}")
-            if not data:
+            peer, file_info = result
+            filename = file_info.get("filename", "")
+            try:
+                await _slskd_enqueue_download(peer, file_info)
+            except Exception:
+                logger.warning(
+                    "slskd enqueue failed peer=%s path=%r; trying next candidate",
+                    peer,
+                    filename,
+                    exc_info=True,
+                )
+                excluded_peers.add(peer)
                 continue
-            # Navigate directories[].files[] structure
-            directories = data.get("directories", []) if isinstance(data, dict) else []
-            for dir_entry in directories:
-                for dl in dir_entry.get("files", []):
-                    if dl.get("filename") != filename:
-                        continue
-                    state = dl.get("state", "")
-                    if "Succeeded" in state or "Completed" in state:
-                        # Move file from slskd download dir to music library
-                        safe_artist = _sanitize(artist) or "Unknown Artist"
-                        safe_album = _sanitize(album) or "Unknown Album"
-                        base = f"{MUSIC_DIR}/{_sanitize(username)}" if username else MUSIC_DIR
-                        dest_dir = f"{base}/{safe_artist}/{safe_album}"
-                        os.makedirs(dest_dir, exist_ok=True)
-                        # slskd saves to {downloads_dir}/{remote_dir}/{filename}
-                        basename = filename.rsplit("\\", 1)[-1] if "\\" in filename else os.path.basename(filename)
-                        found = _find_completed_slskd_file(basename)
-                        if found:
-                            dest = os.path.join(dest_dir, f"{_sanitize(title)}.{basename.rsplit('.', 1)[-1]}")
-                            shutil.move(found, dest)
-                            from app.services.audio_tags import embed_catalog_metadata
-                            await embed_catalog_metadata(
-                                dest,
-                                artist=artist,
-                                title=title,
-                                album=album,
-                                track_number=track_number,
-                                album_artist=album_artist,
-                                year=year,
-                                image_url=image_url,
-                            )
-                            try:
-                                from app.services import bpm as bpm_service
-                                await bpm_service.analyze_and_tag(dest, title, artist)
-                            except Exception:
-                                pass
-                            return True
-                        return False  # download succeeded but file not found locally
-                    if any(s in state for s in ("Failed", "Cancelled", "Errored")):
-                        return False
-        continue
+
+            outcome = await _poll_slskd_transfer(peer, filename)
+            if outcome == "Succeeded":
+                moved = await _move_slskd_file_to_library(
+                    filename,
+                    artist,
+                    title,
+                    album,
+                    username,
+                    image_url,
+                    track_number,
+                    album_artist,
+                    year,
+                )
+                if moved:
+                    return True
+                return False
+            if outcome == "Failed":
+                excluded_peers.add(peer)
+                continue
+            # timeout — try the next search strategy rather than hanging on this peer
+            break
 
     return False
 
